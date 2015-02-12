@@ -1,0 +1,317 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+# Copyright © 2014 Sébastien Gross <seb•ɑƬ•chezwam•ɖɵʈ•org>
+# Created: 2015-01-20
+# Last changed: 2015-01-23 11:05:35
+#
+# This program is free software. It comes without any warranty, to
+# the extent permitted by applicable law. You can redistribute it
+# and/or modify it under the terms of the Do What The Fuck You Want
+# To Public License, Version 2, as published by Sam Hocevar. See
+# http://sam.zoy.org/wtfpl/COPYING for more details.
+#
+# This file is not part of Ansible
+
+import biplist
+import sys
+import os
+import pprint
+
+import jsonpath_rw
+import difflib
+
+# import module snippets
+from ansible.module_utils.basic import *
+
+DOCUMENTATION = '''
+---
+module: osx_plist
+author: Sébastien Gross
+version_added: "1.8"
+short_description: Manage Mac OS X plist
+description:
+    - Manage Mac OS X configuration settings stored in plist files. 
+
+options:
+    file:
+        required: true
+        description:
+            - The full path to the plist file.
+
+    values:
+        required: false
+        default: false
+        description:
+            - A dictionnay made of I(pattern) / I(value) where the pattern
+              is JSON path description as understood by C(jsonpath_rw).
+
+    allow_multiple:
+        required: false
+        default: false
+        description:
+            - If a I(pattern) returns more than one entry C(osx_plist)
+              fails. If you really want to modify more than one entry with
+              the same pattern, you can set I(allow_multiple) to C(yes).
+
+    state:
+        required: false
+        default: present
+        description:
+            - Set (or update) a value if I(present). Delete a path if I(absent).
+
+notes:
+
+    - For this module to work you must install C(biplist)
+      (https://bitbucket.org/wooster/biplist) and C(jsonpath_rw)
+      (https://github.com/kennknowles/python-jsonpath-rw) on target
+      host. You can find homebrew taps at
+      https://github.com/renard/homebrew-cw.
+
+'''
+
+EXAMPLES = '''
+
+Set an entry in a plist:
+
+  tasks:
+    - osx_plist:
+        file: /Users/john/Library/Preferences/com.apple.systempreferences.plist
+        values:
+          'AppleIntlCustomFormat.AppleIntlCustomICUDictionary.AppleICUDateTimeSymbols':
+            5: [ 'AM', 'PM' ]
+
+
+Delete an entry in a plist:
+
+  tasks:
+    - osx_plist:
+        file: /Users/john/Library/Preferences/com.apple.systempreferences.plist
+        state: absent
+        values:
+          'AppleIntlCustomFormat.AppleIntlCustomICUDictionary.AppleICUDateTimeSymbols."5"':
+            []
+
+'''
+
+
+
+def _path_itr(match):
+    '''return an iterator based upon MATCH.PATH. Each item is a path component,
+    start from outer most item.'''
+    if match.context is not None:
+        for path_element in _path_itr(match.context):
+            yield path_element
+        yield str(match.path)
+        
+def _try_index(item):
+    '''Try to convert ITEM into a integer if it matches array access schema: [INT].'''
+    if item.startswith('[') and item.endswith(']'):
+        try:
+            return int(item[1:-1])
+        except ValueError:
+            pass
+    return item
+
+def path_itr(path):
+    '''Ensure PATH is an iterator.
+
+If PATH is a string, convert it to 'jsonpath_rw.jsonpath.Child'.
+
+Item separator is '.'.
+'''
+    if not isinstance(path, types.GeneratorType):
+        if not isinstance(path, jsonpath_rw.jsonpath.Child):
+            path = jsonpath_rw.parse(path)
+        return (x for x in str(path).split('.'))
+    return path
+
+class OSX_Plist(AnsibleModule):
+
+    def __init__(self):
+        AnsibleModule.__init__(
+            self,
+            argument_spec=dict(
+                file=dict(required=True),
+                values=dict(required=False, default=None),
+                state=dict(required=False, choices=['present', 'absent'],
+                           default='present'),
+                allow_multiple=dict(required=False, default=False),
+            ),
+            supports_check_mode=True)
+        self.plist = None
+        self.changed = False
+        self.msg = []
+        self.stdout = []
+        self.stderr = []
+
+        self.load_plist()
+        self.find()
+
+        if self.changed:
+            self.write_plist()
+        
+    def load_plist(self):
+        '''Load plist from 'file' parameter into self.plist as a JSON (dict)
+object. Fails if not found of if plist is invalid.'''
+        if not os.path.exists(self.params['file']):
+            self.fail_json(msg='File "%s" not found.' % self.params['file'])
+        try:
+            self.plist = biplist.readPlist(self.params['file'])
+        except Exception, e:
+            self.fail_json(msg='Cannot load %s:\n%s' % (self.params['file'], e))
+        return self.plist
+
+    def write_plist(self):
+        '''Write plist to 'file' parameter from self.plist JSON (dict) object.
+Fails is something bas happend.'''
+        try:
+            self.plist = biplist.writePlist(self.plist, self.params['file'])
+        except Exception, e:
+            self.fail_json(msg='Cannot write %s:\n%s' % (self.params['file'], e))
+        self.msg += [ "Wrote '%s'" % self.params['file']]
+    
+
+    def update_one(self, path, value):
+        '''Update self.plist with VALUE at PATH.'''
+        actual = self.get(path)
+        expect = value
+        if not (actual == expect):
+            self.changed = True
+            self.update(path, expect)
+            self.stdout += [ '@@ %s @@\n%s' % (path,
+                                               '\n'.join(
+                                                   difflib.ndiff(['%s' % actual],
+                                                                 ['%s' % self.get(path)])))]
+        
+    def delete_one(self, path):
+        '''Delete PATH from self.plist.'''
+        actual = self.get(path)
+        if actual:
+            self.changed = True
+            self.delete(path)
+            self.stdout += [ '@@ %s @@\n%s' % (path,
+                                               '\n'.join(
+                                                   difflib.ndiff(['%s' % actual],
+                                                                 [])))]
+    
+    def find(self):
+        for key in self.params['values'].keys():
+            try:
+                path = jsonpath_rw.parse(key)
+            except jsonpath_rw.lexer.JsonPathLexerError:
+                self.jail_json(msg='Invalid JSON path expression: %s' % key)
+
+            matches = path.find(self.plist)
+            matches_size = len(matches)
+
+            # Not found
+            if matches_size == 0:
+                # Do nothing if we don't have to
+                if self.params['state'] == 'present':
+                    self.add(path, self.params['values'][key])
+                    self.changed = True
+                    self.stdout += [ '@@ %s @@\n%s' %\
+                                     (path,
+                                      '\n'.join(difflib.ndiff([],
+                                                              ['%s' % self.get(path)])))
+                    ]
+            # one and only one match
+            elif matches_size == 1:
+                if self.params['state'] == 'present':
+                    self.update_one(path, self.params['values'][key])
+                else:
+                    self.delete_one(path)
+
+            # multiple match
+            else:
+                if not self.params['allow_multiple']:
+                    self.fail_json(
+                        msg='''Got %s results for key %s. Try passing 'allow_multiple'.''' % \
+                        (matches_size, key))
+                for match in matches:
+                    if self.params['state'] == 'present':
+                        self.update_one(match.full_path, self.params['values'][key])
+                    else:
+                        self.delete_one(match.full_path)                        
+
+    def get(self, path, json=False):
+        '''Return PATH value from self.plist (or JSON if specified).
+
+JSON is only used for recursion.'''
+        path = path_itr(path)
+        if json is False:
+            json = self.plist
+        try:
+            first = _try_index(next(path))
+            return (self.get(path, json[first]) or json[first])
+        except StopIteration:
+            return None
+
+    def update(self, path, value, json=False):
+        '''Update PATH with VALUE from self.plist (or JSON if specified).
+
+JSON is only used for recursion.'''
+        path = path_itr(path)
+        if json is False:
+            json = self.plist
+        try:
+            first = _try_index(next(path))
+            json[first] = self.update(path, value, json[first])
+            return json
+        except StopIteration:
+            return value
+
+    def add(self, path, value, json = False):
+        '''Add (create) new entry for PATH with VALUE in self.plist (or JSON if
+specified).
+
+JSON is only used for recursion.'''
+        path = path_itr(path)
+        if json is False:
+            json = self.plist
+        try:
+            first = _try_index(next(path))
+            if isinstance(first, int):
+                try:
+                    _dummy = json[first]
+                except KeyError:
+                    json = [ None ] * (first + 1)
+                except IndexError:
+                    json += [ None ] * (first + 1 - len(json))
+                json[first] = value
+                return json
+            if not json.has_key(first):
+                json[first] = {}
+            json[first] = self.add(path, value, json[first])
+            return json
+        except StopIteration:
+            return value
+
+    def delete(self, path, json=False):
+        '''Delete PATH from self.plist (or JSON if specified).
+
+JSON is only used for recursion.'''
+        path = path_itr(path)
+        if json is False:
+            json = self.plist
+        try:
+            first = _try_index(next(path))
+            json[first] = self.delete(path, json[first])
+            if not json[first]:
+                del(json[first])
+            return json
+        except StopIteration:
+            return None
+
+
+    
+def main():
+    pl = OSX_Plist()
+
+    pl.exit_json(changed=pl.changed,
+                 msg='\r\n'.join(pl.msg),
+                 stdout='\r\n'.join(pl.stdout),
+                 stderr='\r\n'.join(pl.stderr))
+
+main()
